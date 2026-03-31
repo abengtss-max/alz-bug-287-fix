@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Fix ALZ Bug #287 — Cross-subscription RBAC + DCR name mismatch for Landing Zones DINE policies.
+    Fix ALZ Bug #287 — Cross-subscription RBAC, DCR name, and UAMI name mismatches for Landing Zones DINE policies.
 
 .DESCRIPTION
-    This script discovers and fixes TWO problems in Azure Landing Zone deployments:
+    This script discovers and fixes THREE problems in Azure Landing Zone deployments:
 
     Problem 1 (Issue #287): Landing Zones DINE policy managed identities lack RBAC
     on the Management resource group. The script discovers all affected policy MIs
@@ -12,6 +12,12 @@
     Problem 2: DCR name mismatch in Landing Zones policy parameters. The governance
     stack sometimes sets incorrect DCR names in the dcrResourceId parameter. The
     script compares actual DCR names with policy parameters and corrects mismatches.
+
+    Problem 3: UAMI name mismatch in Landing Zones policy parameters. The governance
+    stack sets the userAssignedIdentityResourceId parameter to a UAMI name that does
+    not match the actual managed identity deployed in the Management resource group.
+    This prevents the AddUserAssignedManagedIdentity_VM sub-policy from assigning the
+    UAMI to VMs, which breaks Change Tracking and other features that require UAMI.
 
     Affected policies:
     - Deploy-VM-Monitoring          (AMA + DCR association for VMs)
@@ -37,6 +43,9 @@
 .PARAMETER FixDcrNames
     Fix Problem 2: Update policy parameters to use correct DCR names.
 
+.PARAMETER FixUamiName
+    Fix Problem 3: Update policy parameters to use correct UAMI resource name.
+
 .PARAMETER WhatIf
     Show what would be changed without making any modifications.
 
@@ -44,8 +53,8 @@
     # Discover issues (dry run)
     .\fix-alz-monitoring.ps1 -ManagementSubscriptionId "d775d3cc-..." -ManagementResourceGroupName "rg-alz-logging-swedencentral" -WhatIf
 
-    # Fix both problems
-    .\fix-alz-monitoring.ps1 -ManagementSubscriptionId "d775d3cc-..." -ManagementResourceGroupName "rg-alz-logging-swedencentral" -FixRbac -FixDcrNames
+    # Fix all problems
+    .\fix-alz-monitoring.ps1 -ManagementSubscriptionId "d775d3cc-..." -ManagementResourceGroupName "rg-alz-logging-swedencentral" -FixRbac -FixDcrNames -FixUamiName
 
 .LINK
     https://github.com/Azure/Azure-Landing-Zones/issues/287
@@ -64,7 +73,8 @@ param(
     [string]$ManagementResourceGroupName,
 
     [switch]$FixRbac,
-    [switch]$FixDcrNames
+    [switch]$FixDcrNames,
+    [switch]$FixUamiName
 )
 
 $ErrorActionPreference = 'Stop'
@@ -263,7 +273,73 @@ Write-Host "  DCR mismatches found: $($dcrMismatches.Count)" -ForegroundColor $(
 Write-Host ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3: Fix RBAC (deploy Bicep)
+# STEP 3: Check UAMI name mismatch
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Host "═══ Step 3: Checking UAMI name in policy parameters ═══" -ForegroundColor Yellow
+Write-Host ""
+
+# Policies that use userAssignedIdentityResourceId parameter
+$uamiPolicies = @(
+    'Deploy-VM-Monitoring',
+    'Deploy-VM-ChangeTrack',
+    'Deploy-VMSS-Monitoring',
+    'Deploy-VMSS-ChangeTrack',
+    'Deploy-MDFC-DefSQL-AMA'
+)
+
+# Get actual UAMI from management RG
+$actualUami = az identity list `
+    --resource-group $ManagementResourceGroupName `
+    --subscription $ManagementSubscriptionId `
+    --query "[0].{name:name, id:id}" -o json 2>$null | ConvertFrom-Json
+
+$uamiMismatch = $null
+if ($actualUami) {
+    Write-Host "  Actual UAMI in management RG: $($actualUami.name)" -ForegroundColor Gray
+    Write-Host ""
+
+    foreach ($polName in $uamiPolicies) {
+        $policyUami = az policy assignment show `
+            --name $polName `
+            --scope $lzScope `
+            --query "parameters.userAssignedIdentityResourceId.value" -o tsv 2>$null
+
+        if ($policyUami) {
+            $policyUamiName = ($policyUami -split '/')[-1]
+            if ($policyUamiName -ne $actualUami.name) {
+                if (-not $uamiMismatch) {
+                    $uamiMismatch = @{
+                        PolicyUamiName = $policyUamiName
+                        ActualUamiName = $actualUami.name
+                        ActualUamiId   = $actualUami.id
+                        AffectedPolicies = @()
+                    }
+                }
+                $uamiMismatch.AffectedPolicies += $polName
+                Write-Host "  [WRONG] $polName" -ForegroundColor Red
+                Write-Host "          Policy expects: $policyUamiName" -ForegroundColor Red
+                Write-Host "          Actual UAMI:    $($actualUami.name)" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  [OK]    $polName → $policyUamiName" -ForegroundColor Green
+            }
+        }
+        else {
+            Write-Host "  [SKIP]  $polName — no userAssignedIdentityResourceId parameter" -ForegroundColor DarkYellow
+        }
+    }
+}
+else {
+    Write-Host "  [WARN]  No managed identity found in $ManagementResourceGroupName" -ForegroundColor DarkYellow
+}
+
+$uamiMismatchCount = if ($uamiMismatch) { $uamiMismatch.AffectedPolicies.Count } else { 0 }
+Write-Host ""
+Write-Host "  UAMI mismatches found: $uamiMismatchCount" -ForegroundColor $(if ($uamiMismatchCount -gt 0) { 'Red' } else { 'Green' })
+Write-Host ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4: Fix RBAC (deploy Bicep)
 # ══════════════════════════════════════════════════════════════════════════════
 $missingRbacMIs = @()
 foreach ($mi in $discoveredMIs) {
@@ -277,7 +353,7 @@ foreach ($mi in $discoveredMIs) {
 }
 
 if ($FixRbac -and $missingRbacMIs.Count -gt 0) {
-    Write-Host "═══ Step 3: Fixing RBAC — Deploying Bicep template ═══" -ForegroundColor Yellow
+    Write-Host "═══ Step 4: Fixing RBAC — Deploying Bicep template ═══" -ForegroundColor Yellow
     Write-Host ""
 
     $principalIds = @($missingRbacMIs | ForEach-Object { $_.PrincipalId })
@@ -343,20 +419,20 @@ if ($FixRbac -and $missingRbacMIs.Count -gt 0) {
     Write-Host ""
 }
 elseif ($missingRbacMIs.Count -gt 0) {
-    Write-Host "═══ Step 3: RBAC fix needed (use -FixRbac to apply) ═══" -ForegroundColor Yellow
+    Write-Host "═══ Step 4: RBAC fix needed (use -FixRbac to apply) ═══" -ForegroundColor Yellow
     Write-Host "  $($missingRbacMIs.Count) policy MI(s) missing roles on Management RG" -ForegroundColor Red
     Write-Host ""
 }
 else {
-    Write-Host "═══ Step 3: RBAC — All MIs already have correct roles ═══" -ForegroundColor Green
+    Write-Host "═══ Step 4: RBAC — All MIs already have correct roles ═══" -ForegroundColor Green
     Write-Host ""
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4: Fix DCR name mismatches
+# STEP 5: Fix DCR name mismatches
 # ══════════════════════════════════════════════════════════════════════════════
 if ($FixDcrNames -and $dcrMismatches.Count -gt 0) {
-    Write-Host "═══ Step 4: Fixing DCR name mismatches in policy parameters ═══" -ForegroundColor Yellow
+    Write-Host "═══ Step 5: Fixing DCR name mismatches in policy parameters ═══" -ForegroundColor Yellow
     Write-Host ""
 
     foreach ($mismatch in $dcrMismatches) {
@@ -401,14 +477,69 @@ if ($FixDcrNames -and $dcrMismatches.Count -gt 0) {
     Write-Host ""
 }
 elseif ($dcrMismatches.Count -gt 0) {
-    Write-Host "═══ Step 4: DCR fix needed (use -FixDcrNames to apply) ═══" -ForegroundColor Yellow
+    Write-Host "═══ Step 5: DCR fix needed (use -FixDcrNames to apply) ═══" -ForegroundColor Yellow
     foreach ($m in $dcrMismatches) {
         Write-Host "  $($m.PolicyName): $($m.CurrentName) → $($m.CorrectName)" -ForegroundColor Red
     }
     Write-Host ""
 }
 else {
-    Write-Host "═══ Step 4: DCR names — All policy parameters match actual DCRs ═══" -ForegroundColor Green
+    Write-Host "═══ Step 5: DCR names — All policy parameters match actual DCRs ═══" -ForegroundColor Green
+    Write-Host ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6: Fix UAMI name mismatch
+# ══════════════════════════════════════════════════════════════════════════════
+if ($FixUamiName -and $uamiMismatch) {
+    Write-Host "═══ Step 6: Fixing UAMI name in policy parameters ═══" -ForegroundColor Yellow
+    Write-Host ""
+
+    foreach ($polName in $uamiMismatch.AffectedPolicies) {
+        Write-Host "  Updating $polName..." -ForegroundColor Cyan
+        Write-Host "    From: $($uamiMismatch.PolicyUamiName)" -ForegroundColor Red
+        Write-Host "    To:   $($uamiMismatch.ActualUamiName)" -ForegroundColor Green
+
+        if ($PSCmdlet.ShouldProcess("$polName", "Update userAssignedIdentityResourceId parameter")) {
+            $existingParams = az policy assignment show `
+                --name $polName `
+                --scope $lzScope `
+                --query "parameters" -o json 2>$null | ConvertFrom-Json
+
+            $paramsHash = @{}
+            foreach ($prop in $existingParams.PSObject.Properties) {
+                $paramsHash[$prop.Name] = @{ value = $prop.Value.value }
+            }
+            $paramsHash['userAssignedIdentityResourceId'] = @{ value = $uamiMismatch.ActualUamiId }
+
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            ($paramsHash | ConvertTo-Json -Depth 5) | Out-File -FilePath $tempFile -Encoding utf8 -NoNewline
+
+            az policy assignment update `
+                --name $polName `
+                --scope $lzScope `
+                --params "@$tempFile" `
+                -o none 2>&1
+
+            Remove-Item $tempFile -ErrorAction SilentlyContinue
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "    UPDATED" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    FAILED — may need manual update" -ForegroundColor Red
+            }
+        }
+    }
+    Write-Host ""
+}
+elseif ($uamiMismatchCount -gt 0) {
+    Write-Host "═══ Step 6: UAMI fix needed (use -FixUamiName to apply) ═══" -ForegroundColor Yellow
+    Write-Host "  $uamiMismatchCount policy(ies) reference '$($uamiMismatch.PolicyUamiName)' but actual is '$($uamiMismatch.ActualUamiName)'" -ForegroundColor Red
+    Write-Host ""
+}
+else {
+    Write-Host "═══ Step 6: UAMI name — All policy parameters match actual UAMI ═══" -ForegroundColor Green
     Write-Host ""
 }
 
@@ -422,15 +553,16 @@ Write-Host ""
 Write-Host "  Policy MIs discovered:    $($discoveredMIs.Count) / $($policyNames.Count)" -ForegroundColor Gray
 Write-Host "  RBAC issues:              $($missingRbacMIs.Count)" -ForegroundColor $(if ($missingRbacMIs.Count -gt 0 -and -not $FixRbac) { 'Red' } else { 'Green' })
 Write-Host "  DCR name mismatches:      $($dcrMismatches.Count)" -ForegroundColor $(if ($dcrMismatches.Count -gt 0 -and -not $FixDcrNames) { 'Red' } else { 'Green' })
+Write-Host "  UAMI name mismatches:     $uamiMismatchCount" -ForegroundColor $(if ($uamiMismatchCount -gt 0 -and -not $FixUamiName) { 'Red' } else { 'Green' })
 Write-Host ""
 
-if ((-not $FixRbac -and $missingRbacMIs.Count -gt 0) -or (-not $FixDcrNames -and $dcrMismatches.Count -gt 0)) {
+if ((-not $FixRbac -and $missingRbacMIs.Count -gt 0) -or (-not $FixDcrNames -and $dcrMismatches.Count -gt 0) -or (-not $FixUamiName -and $uamiMismatchCount -gt 0)) {
     Write-Host "  To fix all issues, run:" -ForegroundColor Yellow
     Write-Host "  .\fix-alz-monitoring.ps1 ``" -ForegroundColor White
     Write-Host "      -ManagementSubscriptionId '$ManagementSubscriptionId' ``" -ForegroundColor White
     Write-Host "      -ManagementResourceGroupName '$ManagementResourceGroupName' ``" -ForegroundColor White
     Write-Host "      -LandingZonesMgName '$LandingZonesMgName' ``" -ForegroundColor White
-    Write-Host "      -FixRbac -FixDcrNames" -ForegroundColor White
+    Write-Host "      -FixRbac -FixDcrNames -FixUamiName" -ForegroundColor White
     Write-Host ""
 }
 
